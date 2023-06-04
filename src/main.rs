@@ -1,17 +1,26 @@
 use anyhow::{anyhow, Result};
+use crossterm::{
+    cursor::{self, MoveToNextLine},
+    event::{self, Event, KeyCode},
+    execute, queue,
+    style::{self, Attribute, Print, SetAttribute},
+    terminal::{self, ClearType},
+    QueueableCommand,
+};
 use serde_derive::{Deserialize, Serialize};
 use std::{
+    cell::Cell,
     collections::{hash_map::Entry, HashMap},
     env,
-    io::{Read, Write},
+    fmt::Display,
+    io::{stdout, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
-    println,
+    println, process,
     sync::{
         mpsc::{channel, Receiver, Sender},
         Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::Duration,
 };
 
 type UserId = String;
@@ -22,6 +31,8 @@ enum Message {
     NewUser,
     Quit(UserId),
     ServerQuit,
+    PromptUpdate,
+    PromptSend(String),
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -39,6 +50,66 @@ impl Packet {
             content: Message::Text(text.to_owned()),
         }
     }
+
+    fn new_prompt_update() -> Self {
+        Packet {
+            from: "".to_owned(),
+            to: "".to_owned(),
+            content: Message::PromptUpdate,
+        }
+    }
+
+    fn new_prompt_send(text: &str) -> Self {
+        Packet {
+            from: "".to_owned(),
+            to: "".to_owned(),
+            content: Message::PromptSend(text.to_owned()),
+        }
+    }
+}
+
+fn print(packet: &Packet) -> Result<()> {
+    let mut s = stdout();
+    match &packet.content {
+        Message::NewUser => {
+            queue!(
+                s,
+                Print(" |?| User "),
+                SetAttribute(Attribute::Bold),
+                Print("["),
+                Print("unknowned"),
+                Print("]"),
+                SetAttribute(Attribute::Reset),
+                Print(" has joined the room."),
+                MoveToNextLine(1)
+            )?;
+        }
+        Message::Text(text) => {
+            queue!(
+                s,
+                SetAttribute(Attribute::Bold),
+                Print("["),
+                Print(&packet.from),
+                Print("] "),
+                SetAttribute(Attribute::Reset)
+            )?;
+            let padding = String::from_utf8(vec![' ' as u8; &packet.from.len() + 3]).unwrap();
+            text.split('\n').enumerate().for_each(|(num, line)| {
+                if num > 0 {
+                    queue!(s, Print(&padding)).expect("");
+                }
+                queue!(
+                    s,
+                    Print(line),
+                    terminal::Clear(ClearType::UntilNewLine),
+                    MoveToNextLine(1)
+                )
+                .expect("");
+            });
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 struct Connection {
@@ -69,7 +140,7 @@ impl Connection {
             let header_length = u32::from_be_bytes(sig_header);
             let mut server_sig = vec![0u8; header_length as usize];
             self.stream.read_exact(&mut server_sig)?;
-            println!("received server sig: {}", String::from_utf8(server_sig)?);
+            //println!("received server sig: {}", String::from_utf8(server_sig)?);
 
             let response_header = (name.len() as u32).to_be_bytes();
             self.stream.write_all(&response_header)?;
@@ -118,7 +189,6 @@ impl Connection {
             let stream = stream_read.try_clone().expect("clone stream");
             match bincode::deserialize_from(stream) {
                 Ok(message) => {
-                    println!("Got message: {:?}", message);
                     room_inbox.send(message).expect("sending msg");
                 }
                 Err(_) => {
@@ -135,7 +205,6 @@ impl Connection {
                             content: Message::ServerQuit,
                         }
                     };
-                    println!("Disconnecting");
                     room_inbox.send(quit_messsage).expect("sending msg");
                     break;
                 }
@@ -157,7 +226,9 @@ struct Room {
     connections: Arc<Mutex<HashMap<UserId, Connection>>>,
     handles: Vec<JoinHandle<()>>, // XXX Maybe just Option
     inbox: Receiver<Packet>,
+    inbox_post: Sender<Packet>,
     local_id: Option<UserId>,
+    history: Vec<Packet>,
 }
 
 impl Room {
@@ -165,6 +236,7 @@ impl Room {
         println!("Starting server");
 
         let (client_inbox, inbox) = channel::<Packet>();
+        let inbox_post = client_inbox.clone();
 
         // server thread
         let server = TcpListener::bind(addr).expect("Bind");
@@ -176,7 +248,7 @@ impl Room {
                 let mut conn = Connection::new(&stream, &client_inbox).expect("new connection");
 
                 if let Ok(user_id) = conn.handshake(None) {
-                    println!("New connection for {}", &user_id);
+                    //println!("New connection for {}", &user_id);
                     if conn.start().is_ok() {
                         if let Entry::Vacant(entry) = clients1
                             .lock()
@@ -197,7 +269,9 @@ impl Room {
             connections: clients,
             handles,
             inbox,
+            inbox_post,
             local_id: None,
+            history: Vec::new(),
         })
     }
 
@@ -219,14 +293,23 @@ impl Room {
             connections: Arc::new(Mutex::new(connections)),
             handles: Vec::new(),
             inbox,
+            inbox_post: inbox_server,
             local_id: Some(local_id),
+            history: Vec::new(),
         })
     }
 
     fn send(&self, packet: Packet) -> Result<()> {
         if let Ok(connections) = self.connections.lock() {
             for (_, conn) in connections.iter() {
+                // println!(
+                //     "from= {:?}, local_id: {:?}",
+                //     &packet.from,
+                //     self.local_id.as_ref().unwrap_or(&"server".to_owned())
+                // );
+                //if &packet.from != self.local_id.as_ref().unwrap_or(&"server".to_owned()) {
                 conn.send(&packet);
+                //}
             }
         }
         Ok(())
@@ -236,10 +319,190 @@ impl Room {
         self.local_id.is_none()
     }
 
-    fn update(&self) -> Result<()> {
-        let message = self.inbox.recv()?;
-        println!("Processing message {:?}", message);
+    fn update(&mut self) -> Result<()> {
+        let mut s = stdout();
+
+        if let Some(message) = self.inbox.recv().ok() {
+            match &message.content {
+                Message::NewUser => {
+                    print(&message)?;
+                }
+                Message::Text(_) => {
+                    print(&message)?;
+                    s.flush()?;
+
+                    // server forwards message to other clients
+                    if self.is_server() {
+                        self.send(message.clone())?;
+                        self.history.push(message.clone());
+                    }
+                }
+                Message::PromptSend(text) => {
+                    let packet = Packet {
+                        from: self
+                            .local_id
+                            .as_ref()
+                            .unwrap_or(&String::from("server"))
+                            .to_owned(),
+                        to: "".to_owned(),
+                        content: Message::Text(text.clone()),
+                    };
+                    if self.is_server() {
+                        print(&packet)?;
+                        s.flush()?;
+                        self.history.push(packet.clone());
+                    }
+
+                    self.send(packet)?;
+                }
+                _ => {}
+            }
+        }
         Ok(())
+    }
+}
+
+struct Prompt {
+    text: Vec<String>,
+    cursor: (u16, u16),
+}
+
+impl Prompt {
+    fn new() -> Prompt {
+        Prompt {
+            text: vec!["".to_owned()],
+            cursor: (0, 0),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.text.push("".to_owned());
+        self.cursor = (0, 0);
+    }
+
+    fn text(&self) -> String {
+        self.text
+            .iter()
+            .fold(String::new(), |str, line| str + line + "\n")
+            .trim_end()
+            .into()
+    }
+
+    fn print(&self) {
+        let mut s = stdout();
+        let sep = ['—'; 30];
+        queue!(
+            s,
+            cursor::MoveToColumn(0),
+            style::Print(sep.iter().collect::<String>()),
+            terminal::Clear(ClearType::UntilNewLine),
+            style::Print("\n"),
+            cursor::MoveToColumn(0)
+        )
+        .expect("");
+        for (num, line) in self.text.iter().enumerate() {
+            if num == 0 {
+                s.queue(style::Print("message ")).expect("");
+            } else {
+                s.queue(style::Print("        ")).expect("");
+            }
+            queue!(
+                s,
+                style::Print("|"),
+                style::Print(line),
+                terminal::Clear(ClearType::UntilNewLine),
+                style::Print("\n"),
+                cursor::MoveToColumn(0)
+            )
+            .expect("");
+        }
+        queue!(s, terminal::Clear(ClearType::FromCursorDown)).expect("");
+
+        // Move terminal cursor to prompt cursor
+        let cursor = self.cursor();
+        if self.text.len() > 0 {
+            queue!(
+                s,
+                cursor::MoveToPreviousLine(self.text.len() as u16 - cursor.1)
+            )
+            .expect("");
+        }
+        queue!(s, cursor::MoveToColumn(9 + cursor.0)).expect("");
+
+        s.flush().expect("");
+    }
+
+    fn rewind(&self) {
+        let mut s = stdout();
+        s.queue(cursor::MoveToPreviousLine(self.cursor.1 + 1 as u16))
+            .expect("");
+    }
+
+    fn move_cursor_left(&mut self) {
+        if self.cursor().0 == 0 && self.cursor.1 > 0 {
+            self.cursor.1 = self.cursor.1.saturating_sub(1);
+            self.cursor.0 = self.text[self.cursor.1 as usize].len() as u16;
+        } else {
+            self.cursor.0 = self.cursor().0.saturating_sub(1);
+        }
+    }
+
+    fn move_cursor_right(&mut self) {
+        let line_len = self.text[self.cursor.1 as usize].len() as u16;
+        let num_lines = self.text.len() as u16;
+        if self.cursor().0 == line_len && self.cursor.1 < num_lines - 1 {
+            self.cursor.1 += 1;
+            self.cursor.0 = 0;
+        } else {
+            self.cursor.0 += 1;
+        }
+    }
+
+    fn move_cursor_up(&mut self) {
+        self.cursor.1 = self.cursor.1.saturating_sub(1);
+    }
+
+    fn move_cursor_down(&mut self) {
+        self.cursor.1 = (self.cursor.1 + 1).min(self.text.len() as u16 - 1);
+    }
+
+    fn put_char(&mut self, ch: char) {
+        if ch.len_utf8() == 1 {
+            let cursor = self.cursor();
+            self.text[cursor.1 as usize].insert(cursor.0 as usize, ch);
+            self.cursor = (cursor.0 + 1 as u16, cursor.1);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor().0 == 0 {
+            if self.cursor.1 > 0 {
+                let cur_vpos = self.cursor.1 as usize;
+                let new_vpos = cur_vpos - 1;
+                let new_hpos = self.text[new_vpos].len() as u16;
+                let cur_line = self.text[cur_vpos].clone();
+                self.text[new_vpos].push_str(&cur_line);
+                self.text.remove(cur_vpos);
+                self.cursor = (new_hpos, new_vpos as u16);
+            }
+        } else {
+            let pos = self.cursor().0 as usize - 1;
+            self.text[self.cursor.1 as usize].remove(pos);
+            self.cursor.0 -= 1;
+        }
+    }
+
+    fn newline(&mut self) {
+        let split_pos = self.cursor().0 as usize;
+        let new_line = self.text[self.cursor.1 as usize].split_off(split_pos);
+        self.text.insert(self.cursor.1 as usize + 1, new_line);
+        self.cursor = (0, self.cursor.1 + 1);
+    }
+
+    fn cursor(&self) -> (u16, u16) {
+        let line_len = self.text[self.cursor.1 as usize].len() as u16;
+        (self.cursor.0.min(line_len), self.cursor.1)
     }
 }
 
@@ -250,7 +513,7 @@ fn main() -> Result<()> {
         return Err(anyhow!("Not enough arguments"));
     }
 
-    let room = if let Some(pos) =
+    let mut room = if let Some(pos) =
         args.iter()
             .enumerate()
             .find_map(|(pos, arg)| if arg == "--client" { Some(pos) } else { None })
@@ -280,17 +543,76 @@ fn main() -> Result<()> {
         Err(anyhow!("Missing --client or --server argument"))
     }?;
 
-    if room.is_server() {
-        thread::sleep(Duration::from_secs(5));
+    terminal::enable_raw_mode()?;
+    let mut stdout = stdout();
+    execute!(
+        stdout,
+        event::PushKeyboardEnhancementFlags(
+            event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
+    )?;
 
-        for _i in 1..10 {
-            room.send(Packet::new_text("Hello"))?;
+    let prompt = Arc::new(Mutex::new(Prompt::new()));
+    let prompt2 = prompt.clone();
+
+    let inbox = room.inbox_post.clone();
+    thread::spawn(move || loop {
+        let event = event::read().expect("read terminal");
+        let mut prompt = prompt2.lock().expect("lock prompt");
+        match event {
+            Event::Key(key_event) => match key_event.code {
+                KeyCode::Char(c) => {
+                    prompt.put_char(c);
+                }
+                KeyCode::Tab /*if key_event.modifiers.contains(event::KeyModifiers::SHIFT)*/ => {
+                    inbox
+                        .send(Packet::new_prompt_send(&prompt.text()))
+                        .expect("send prompt");
+                    prompt.clear();
+                }
+                KeyCode::Enter => {
+                    prompt.newline();
+                }
+                KeyCode::Backspace => {
+                    prompt.backspace();
+                }
+                KeyCode::Up => {
+                    prompt.move_cursor_up();
+                }
+                KeyCode::Down => {
+                    prompt.move_cursor_down();
+                }
+                KeyCode::Right => {
+                    prompt.move_cursor_right();
+                }
+                KeyCode::Left => {
+                    prompt.move_cursor_left();
+                }
+                // KeyCode::Delete => {
+                //     let mut prompt = prompt2.lock().expect("lock prompt");
+                //     prompt.delete();
+                // }
+                KeyCode::Esc => {
+                    terminal::disable_raw_mode().expect("");
+                    execute!(stdout, event::PopKeyboardEnhancementFlags).expect("");
+                    process::exit(1);
+                }
+                _ => (),
+            },
+            _ => {}
         }
-    }
+        inbox
+            .send(Packet::new_prompt_update())
+            .expect("update prompt");
+    });
 
     loop {
+        if let Some(prompt) = prompt.lock().ok() {
+            prompt.print();
+            prompt.rewind();
+        }
+
         room.update()?;
     }
-
-    Ok(())
+    //Ok(())
 }
