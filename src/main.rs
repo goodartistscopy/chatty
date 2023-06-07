@@ -9,10 +9,8 @@ use crossterm::{
 };
 use serde_derive::{Deserialize, Serialize};
 use std::{
-    cell::Cell,
     collections::{hash_map::Entry, HashMap},
     env,
-    fmt::Display,
     io::{stdout, Read, Write},
     net::{TcpListener, TcpStream, ToSocketAddrs},
     println, process,
