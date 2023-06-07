@@ -538,7 +538,14 @@ fn main() -> Result<()> {
             Err(anyhow!("--client requires an argument after"))
         }
     } else if args.iter().find(|&arg| arg == "--server").is_some() {
-        Room::create("127.0.0.1:1234")
+        use local_ip_address::local_ip;
+        let local_ip = local_ip();
+        if let Ok(ip) = local_ip {
+            Room::create((ip, 1234))
+        }
+        else {
+            Room::create("192.168.0.23:1234")
+        }
     } else {
         Err(anyhow!("Missing --client or --server argument"))
     }?;
