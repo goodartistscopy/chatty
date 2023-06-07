@@ -1,4 +1,4 @@
-git  test app for communication between a server and multiple clients over TCP. Uses [bincode/serde](https://docs.rs/bincode/latest/bincode/) to (de)serialize messages (from)to a `TcpStream`.
+Rust test app for communication between a server and multiple clients over TCP. Uses [bincode/serde](https://docs.rs/bincode/latest/bincode/) to (de)serialize messages (from)to a `TcpStream`.
 
 Used as investigation for adding multiplayer into a [tetris clone](https://github.com/goodartistscopy/ttrys).
 
